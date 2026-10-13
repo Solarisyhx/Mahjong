@@ -1,0 +1,351 @@
+# ============================================================
+# 平湖花麻将 - 全量构建工作流
+# 触发方式：
+#   1. 打 tag（v1.0.0 等）→ 自动构建并创建 Release
+#   2. 手动触发（Actions 页面 → Run workflow）
+# ============================================================
+name: 全量构建
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 v1.0.0）'
+        required: false
+        default: 'v1.0.0-dev'
+
+# 授予 Release 创建权限
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: '3.11'
+  APP_NAME: '平湖花麻将'
+  APP_NAME_EN: 'PingHuMahjong'
+
+jobs:
+  # ==========================================================
+  # 1. 生成图标（供后续所有 Job 复用）
+  # ==========================================================
+  icons:
+    name: 生成图标
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 安装 Pillow
+        run: pip install Pillow
+
+      - name: 生成图标
+        run: python tools/gen_icons.py
+
+      - name: 上传图标产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: icons
+          path: |
+            icons/
+            spk/PACKAGE_ICON.PNG
+            spk/PACKAGE_ICON_256.PNG
+            installer/icon.ico
+          retention-days: 1
+
+  # ==========================================================
+  # 2. 构建 Windows 客户端（PyInstaller 打包 exe）
+  # ==========================================================
+  client-windows:
+    name: 构建 Windows 客户端
+    needs: icons
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 下载图标
+        uses: actions/download-artifact@v4
+        with:
+          name: icons
+          path: .
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install websockets==12.0 pyinstaller==6.3.0
+
+      - name: PyInstaller 打包
+        run: pyinstaller client.spec --clean --noconfirm
+
+      - name: 准备使用说明
+        shell: bash
+        run: |
+          if [ -f README.md ]; then
+            cp README.md "dist/使用说明.txt"
+          else
+            echo "平湖花麻将使用说明" > "dist/使用说明.txt"
+          fi
+
+      - name: 上传客户端 exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: mahjong-client-windows
+          path: dist/平湖花麻将.exe
+          retention-days: 1
+
+  # ==========================================================
+  # 3. 构建 Windows 安装包（Inno Setup）
+  # ==========================================================
+  installer-windows:
+    name: 构建 Windows 安装包
+    needs: client-windows
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载客户端 exe
+        uses: actions/download-artifact@v4
+        with:
+          name: mahjong-client-windows
+          path: installer/payload
+
+      - name: 下载图标
+        uses: actions/download-artifact@v4
+        with:
+          name: icons
+          path: .
+
+      - name: 准备使用说明
+        shell: bash
+        run: |
+          if [ -f README.md ]; then
+            cp README.md "installer/payload/使用说明.txt"
+          else
+            echo "平湖花麻将使用说明" > "installer/payload/使用说明.txt"
+          fi
+
+      - name: 安装 Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: 编译安装程序
+        working-directory: installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe"
+          }
+          Write-Host "使用 ISCC: $iscc"
+          & $iscc setup.iss
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: mahjong-installer-windows
+          path: installer/output/*.exe
+          retention-days: 1
+
+  # ==========================================================
+  # 4. 构建群晖 SPK（多架构）
+  # ==========================================================
+  spk:
+    name: 构建 SPK (${{ matrix.arch }})
+    needs: icons
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - x86_64
+          - aarch64
+          - armv7
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载图标
+        uses: actions/download-artifact@v4
+        with:
+          name: icons
+          path: .
+
+      - name: 修改 INFO 架构
+        run: |
+          cd spk
+          sed -i "s/^arch=.*/arch=\"${{ matrix.arch }}\"/" INFO
+          cat INFO | grep -E "^arch|^version|^package"
+
+      - name: 设置脚本权限
+        run: chmod +x spk/build_spk.sh spk/scripts/*
+
+      - name: 构建 SPK
+        run: |
+          cd spk
+          ./build_spk.sh
+
+      - name: 上传 SPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: mahjong-spk-${{ matrix.arch }}
+          path: spk/output/*.spk
+          retention-days: 1
+
+  # ==========================================================
+  # 5. 构建 Docker 镜像（NAS 备用方案）
+  # ==========================================================
+  docker:
+    name: 构建 Docker 镜像
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 构建镜像（多架构）
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: false
+          tags: mahjong-server:${{ github.ref_name || 'dev' }}
+          outputs: type=docker,dest=/tmp/mahjong-server.tar
+
+      - name: 压缩镜像
+        run: |
+          cd /tmp
+          gzip -f mahjong-server.tar
+          ls -lh mahjong-server.tar.gz
+
+      - name: 上传 Docker 镜像
+        uses: actions/upload-artifact@v4
+        with:
+          name: mahjong-docker-image
+          path: /tmp/mahjong-server.tar.gz
+          retention-days: 1
+
+  # ==========================================================
+  # 6. 创建 Release 并上传所有产物（生成下载链接）
+  # ==========================================================
+  release:
+    name: 创建 Release
+    needs:
+      - client-windows
+      - installer-windows
+      - spk
+      - docker
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载所有产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 整理产物到 release 目录
+        run: |
+          mkdir -p release
+          echo "=== 收集产物 ==="
+          find artifacts -type f -exec ls -lh {} \;
+
+          # Windows 客户端 exe
+          cp artifacts/mahjong-client-windows/*.exe release/ 2>/dev/null || true
+
+          # Windows 安装包
+          cp artifacts/mahjong-installer-windows/*.exe release/ 2>/dev/null || true
+
+          # 各架构 SPK
+          cp artifacts/mahjong-spk-x86_64/*.spk release/ 2>/dev/null || true
+          cp artifacts/mahjong-spk-aarch64/*.spk release/ 2>/dev/null || true
+          cp artifacts/mahjong-spk-armv7/*.spk release/ 2>/dev/null || true
+
+          # Docker 镜像
+          cp artifacts/mahjong-docker-image/*.tar.gz release/ 2>/dev/null || true
+
+          # 使用说明
+          if [ -f README.md ]; then
+            cp README.md "release/使用说明.md"
+          fi
+
+          echo ""
+          echo "=== release 目录内容 ==="
+          ls -lh release/
+
+      - name: 提取版本号
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "版本: $VERSION"
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: 平湖花麻将 ${{ steps.version.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## 平湖花麻将 ${{ steps.version.outputs.version }}
+
+            ### 下载
+
+            | 文件 | 平台 | 说明 |
+            |------|------|------|
+            | `平湖花麻将.exe` | Windows | 绿色版，双击即用，无需安装 |
+            | `平湖花麻将安装包.exe` | Windows | 完整安装程序（含快捷方式、卸载） |
+            | `mahjong-x86_64-*.spk` | 群晖 | Intel/AMD CPU（DS920+ 等） |
+            | `mahjong-aarch64-*.spk` | 群晖 | ARM64（DS923+、DS223 等） |
+            | `mahjong-armv7-*.spk` | 群晖 | ARMv7（DS218 等老机型） |
+            | `mahjong-server.tar.gz` | Docker | NAS 备用方案 |
+
+            ### 快速开始
+
+            **Windows 玩家：**
+            1. 下载 `平湖花麻将.exe`
+            2. 双击运行
+            3. 输入服务器地址（如 `ws://192.168.1.100:9527`）、房间名、昵称
+            4. 点击"连接"→"准备"，4 人齐后自动开局
+
+            **群晖用户：**
+            1. 下载对应架构的 `.spk` 文件
+            2. DSM → 套件中心 → 手动安装 → 上传
+            3. 按向导完成安装
+            4. 套件中心 → 启动
+
+            ### 规则说明
+
+            - 144 张牌（含 8 张花牌：梅兰竹菊春夏秋冬）
+            - 必须有花牌才能胡
+            - 有百搭牌（开局翻牌决定）
+            - 不能吃牌，可以碰、杠
+            - 补杠时别人可以抢杠胡（包三家）
+            - 荒局：牌墙摸完，不计分
+            - 结算公式：`(花数 + 1) × 2^总番`
+
+            详见 `使用说明.md`。
+
+          files: |
+            release/*
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
